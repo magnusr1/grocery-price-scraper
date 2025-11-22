@@ -1,0 +1,42 @@
+name: Scrape Grocery Prices
+
+on:
+  schedule:
+    # Run every 6 hours at :15 past the hour (avoid top-of-hour delays)
+    - cron: '15 */6 * * *'
+  
+  # Allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  scrape-and-process:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm install
+        
+      - name: Run price scraping
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
+        run: node batch-scraper.js
+        timeout-minutes: 30
+        
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: screenshots/
+          retention-days: 7
