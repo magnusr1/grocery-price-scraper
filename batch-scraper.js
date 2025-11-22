@@ -19,12 +19,20 @@ class Database {
     const result = await this.client.query(`
       SELECT ci.id, ci.name
       FROM canonical_ingredients ci
-      LEFT JOIN price_observations po ON ci.id = po.canonical_ingredient_id
-      WHERE po.id IS NULL
-      ORDER BY ci.created_at ASC
+      ORDER BY 
+        CASE WHEN ci.last_scraped_at IS NULL THEN 0 ELSE 1 END,
+        ci.last_scraped_at ASC NULLS FIRST
       LIMIT $1
     `, [limit]);
     return result.rows;
+  }
+
+  async markAsScraped(ingredientId) {
+    await this.client.query(`
+      UPDATE canonical_ingredients
+      SET last_scraped_at = NOW()
+      WHERE id = $1
+    `, [ingredientId]);
   }
 
   async saveCandidates(candidates) {
@@ -614,6 +622,7 @@ async function processIngredient(browser, db, ingredient) {
     
     if (odaProducts.length === 0 && menyProducts.length === 0) {
       console.log('❌ No relevant products found on any store after filtering\n');
+      await db.markAsScraped(ingredient.id);
       return { success: false, error: 'No relevant products found', noResults: true };
     }
     
@@ -698,9 +707,14 @@ async function processIngredient(browser, db, ingredient) {
     console.log('✓ Saved observation to database');
     console.log(`=== Completed: ${ingredient.name} ===\n`);
     
+    await db.markAsScraped(ingredient.id);
+    
     return { success: true };
   } catch (error) {
     console.error(`Error processing ${ingredient.name}:`, error);
+    
+    await db.markAsScraped(ingredient.id);
+    
     return { success: false, error: error.message };
   }
 }
