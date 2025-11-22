@@ -137,37 +137,25 @@ async function scrapeOdaProducts(browser, query, limit) {
       }
     }
 
-    // Fall back to DOM evaluation
+    // Fall back to DOM evaluation (using EXACT working code)
     console.log('Falling back to DOM evaluation');
     
-    // Debug: Count product tiles
-    const tileCount = await page.evaluate(() => {
-      return document.querySelectorAll('[data-testid="product-tile"]').length;
-    });
-    console.log(`Found ${tileCount} product tiles in DOM`);
-    
     const extractedProducts = await page.evaluate(() => {
-      const products = [];
-      const productCards = document.querySelectorAll('[data-testid="product-tile"]');
-      
-      productCards.forEach(card => {
-        const link = card.querySelector('a[href^="/no/products/"]');
-        const img = card.querySelector('img');
-        const priceElement = card.querySelector('[data-testid="product-tile-price"]');
-        
-        if (link && priceElement) {
-          const href = link.getAttribute('href');
-          const ariaLabel = link.getAttribute('aria-label') || '';
-          const productId = href ? href.split('/')[3]?.split('-')[0] : '';
+      const productTiles = Array.from(document.querySelectorAll('[data-testid="product-tile"]')).slice(0, 10);
+      const results = [];
+
+      for (const tile of productTiles) {
+        try {
+          const ariaLabel = tile.getAttribute('aria-label') || '';
+          if (!ariaLabel) continue;
           
-          const priceText = priceElement.textContent.trim();
-          const price = parseFloat(priceText.replace(/[^\d,]/g, '').replace(',', '.'));
-          
-          const unitPriceElement = card.querySelector('[data-testid="product-tile-unit-price"]');
-          const unitPrice = unitPriceElement ? unitPriceElement.textContent.trim() : '';
+          const parts = ariaLabel.split(' - ');
+          const title = parts[0]?.trim();
+          if (!title) continue;
           
           // Enhanced weight extraction to handle multi-packs (2×75g, 3x100g, 2pk, etc.)
-          let weight = '';
+          let weight;
+          
           const multiPackMatch = ariaLabel.match(/(\d+)\s*[x×]\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i) ||
                                  ariaLabel.match(/(\d+)\s*pk\s*[aà]?\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i);
           
@@ -176,26 +164,46 @@ async function scrapeOdaProducts(browser, query, limit) {
             const baseValue = parseFloat(multiPackMatch[2].replace(',', '.'));
             const unit = multiPackMatch[3];
             const totalValue = multiplier * baseValue;
-            // Preserve space between number and unit for proper parsing downstream
             weight = `${totalValue} ${unit}`;
           } else {
             const weightMatch = ariaLabel.match(/(\d+[.,]?\d*)\s*(l|kg|g|ml|stk)/i);
-            weight = weightMatch ? weightMatch[0] : '';
+            weight = weightMatch ? weightMatch[0] : undefined;
           }
           
-          products.push({
-            id: productId || '',
-            title: ariaLabel,
-            price: price || 0,
+          const allText = (tile.textContent || '').replace(/\u00A0/g, ' ');
+          
+          const priceMatch = allText.match(/kr\s*(\d+[.,]\d+)|(\d+[.,]\d+)\s*kr/);
+          const priceStr = priceMatch ? (priceMatch[1] || priceMatch[2]).replace(',', '.') : null;
+          const price = priceStr ? parseFloat(priceStr) : 0;
+          if (price <= 0) continue;
+          
+          const unitPriceMatch = allText.match(/(\d+[.,]\d+)\s*kr?\s*\/\s*([lkgml]+)/i);
+          const unitPrice = unitPriceMatch ? `${unitPriceMatch[1]} kr/${unitPriceMatch[2]}` : undefined;
+          
+          const imgEl = tile.querySelector('img');
+          const imageUrl = imgEl?.getAttribute('src');
+          
+          const linkEl = tile.querySelector('a[href*="/products/"]');
+          const href = linkEl?.getAttribute('href') || '';
+          const productIdMatch = href.match(/\/products\/(\d+)-/);
+          const productId = productIdMatch ? productIdMatch[1] : `product-${results.length}`;
+          
+          results.push({
+            id: productId,
+            title,
+            brand: undefined,
+            price,
             unit_price: unitPrice,
-            weight: weight,
-            image_url: img ? img.src : '',
-            badges: []
+            weight,
+            image_url: imageUrl || undefined,
+            badges: [],
           });
+        } catch (error) {
+          // Skip products with errors
         }
-      });
-      
-      return products;
+      }
+
+      return results;
     });
 
     products.push(...extractedProducts.slice(0, limit));
@@ -222,80 +230,80 @@ async function scrapeMenyProducts(browser, query, limit) {
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Debug: Check page content
-    const pageTitle = await page.title();
-    const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 200));
-    console.log(`Meny page title: ${pageTitle}`);
-    console.log(`Meny page preview: ${bodyText.substring(0, 100)}...`);
-    
-    // Debug: Count product cards
-    const productCount = await page.evaluate(() => {
-      return document.querySelectorAll('article.ProductTeaser').length;
-    });
-    console.log(`Found ${productCount} product cards in DOM`);
-
+    // Use EXACT working Meny scraper code
     const extractedProducts = await page.evaluate(() => {
-      const products = [];
-      const productCards = document.querySelectorAll('.ListItemCard');
-      
-      productCards.forEach(card => {
-        const nameElement = card.querySelector('.heading-5');
-        const priceElement = card.querySelector('.price');
-        const linkElement = card.querySelector('a.ListItemCard-link');
-        const imageElement = card.querySelector('.ListItemCard-image img');
-        
-        if (nameElement && priceElement && linkElement) {
-          const productName = nameElement.textContent.trim();
-          const href = linkElement.getAttribute('href') || '';
-          const productId = href.split('/').pop() || '';
+      const productLinks = Array.from(document.querySelectorAll('a[href*="/varer/"]'));
+      const results = [];
+      const seen = new Set();
+
+      for (const link of productLinks) {
+        try {
+          const href = link.getAttribute('href') || '';
+          if (!href || seen.has(href)) continue;
           
-          let priceText = priceElement.textContent.trim();
-          priceText = priceText.replace(/\u00A0/g, ' ').replace(/,-/g, '');
-          const priceMatch = priceText.match(/(\d+[.,]?\d*)/);
-          const price = priceMatch ? parseFloat(priceMatch[1].replace(',', '.')) : 0;
+          const container = link.closest('article, li, div') || link.parentElement;
+          if (!container) continue;
           
-          let unitPrice = '';
-          let packageSize = '';
-          const compareElement = card.querySelector('.ListItemCard-comparePrice');
-          if (compareElement) {
-            const compareText = compareElement.textContent.trim();
-            const unitMatch = compareText.match(/(\d+[.,]?\d*)\s*(kr\/\S+)/);
-            if (unitMatch) {
-              unitPrice = unitMatch[0];
-            }
-            
-            // Enhanced weight extraction to handle multi-packs (2×75g, 3x100g, 2pk, etc.)
-            const multiPackMatch = compareText.match(/(\d+)\s*[x×]\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i) ||
-                                   compareText.match(/(\d+)\s*pk\s*[aà]?\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i);
-            
-            if (multiPackMatch) {
-              const multiplier = parseInt(multiPackMatch[1]);
-              const baseValue = parseFloat(multiPackMatch[2].replace(',', '.'));
-              const unit = multiPackMatch[3];
-              const totalValue = multiplier * baseValue;
-              // Preserve space between number and unit for proper parsing downstream
-              packageSize = `${totalValue} ${unit}`;
-            } else {
-              const sizeMatch = compareText.match(/(\d+[.,]?\d*\s*(g|kg|ml|l|stk))/);
-              if (sizeMatch) {
-                packageSize = sizeMatch[0];
-              }
-            }
+          const allText = container.textContent || '';
+          if (allText.length < 20) continue;
+          
+          const h3Element = container.querySelector('h3');
+          const title = h3Element?.textContent?.trim();
+          if (!title || title.length < 3) continue;
+          
+          const priceText = allText.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ');
+          const priceMatch = priceText.match(/(\d+[.,]\d+)\s*kr(?!\/)/) || priceText.match(/kr\s*(\d+[.,]\d+)/);
+          if (!priceMatch) continue;
+          
+          const priceStr = (priceMatch[1] || priceMatch[2] || '0').replace(',', '.');
+          const price = parseFloat(priceStr);
+          if (price <= 0) continue;
+          
+          const unitPriceMatch = priceText.match(/(\d+[.,]\d+)\s*kr\s*\/\s*(kg|l|stk)/i);
+          const unitPrice = unitPriceMatch ? `${unitPriceMatch[1]} kr/${unitPriceMatch[2]}` : undefined;
+          
+          // Enhanced weight extraction to handle multi-packs (2×75g, 3x100g, 2pk, etc.)
+          let weight;
+          
+          const multiPackMatch = allText.match(/(\d+)\s*[x×]\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i) ||
+                                 allText.match(/(\d+)\s*pk\s*[aà]?\s*(\d+[.,]?\d*)\s*(g|kg|l|ml)\b/i);
+          
+          if (multiPackMatch) {
+            const multiplier = parseInt(multiPackMatch[1]);
+            const baseValue = parseFloat(multiPackMatch[2].replace(',', '.'));
+            const unit = multiPackMatch[3];
+            const totalValue = multiplier * baseValue;
+            weight = `${totalValue} ${unit}`;
+          } else {
+            const weightMatch = allText.match(/(\d+[.,]?\d*)\s*(g|kg|l|ml|stk)\b/i);
+            weight = weightMatch ? weightMatch[0] : undefined;
           }
           
-          products.push({
+          const imgEl = container.querySelector('img');
+          const imageUrl = imgEl?.getAttribute('src');
+          
+          const productIdMatch = href.match(/\/varer\/[^\/]+\/[^\/]+\/[^\/]+\/([^\/]+)/);
+          const productId = productIdMatch ? productIdMatch[1] : href.split('/').pop() || `meny-${results.length}`;
+          
+          seen.add(href);
+          results.push({
             id: productId,
-            title: productName,
-            price: price,
+            title,
+            brand: undefined,
+            price,
             unit_price: unitPrice,
-            weight: packageSize,
-            image_url: imageElement ? imageElement.src : '',
-            badges: []
+            weight,
+            image_url: imageUrl || undefined,
+            badges: [],
           });
+          
+          if (results.length >= 10) break;
+        } catch (error) {
+          // Skip products with errors
         }
-      });
-      
-      return products;
+      }
+
+      return results;
     });
 
     products.push(...extractedProducts.slice(0, limit));
