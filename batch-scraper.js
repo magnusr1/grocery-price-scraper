@@ -91,9 +91,28 @@ class Database {
 async function scrapeOdaProducts(browser, query, limit) {
   const page = await browser.newPage();
   const products = [];
+  const networkRequests = [];
 
   try {
     await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Listen for API responses (network interception)
+    page.on('response', async (response) => {
+      const url = response.url();
+      const method = response.request().method();
+      
+      if (url.includes('oda.com') && url.includes('/api/') && url.includes('product')) {
+        try {
+          const contentType = response.headers()['content-type'] || '';
+          if (contentType.includes('application/json')) {
+            const data = await response.json();
+            networkRequests.push({ url, method, response: data });
+          }
+        } catch (error) {
+          // Ignore JSON parsing errors
+        }
+      }
+    });
     
     const searchUrl = `https://oda.com/no/search/products/?q=${encodeURIComponent(query)}`;
     console.log(`Navigating to: ${searchUrl}`);
@@ -101,6 +120,19 @@ async function scrapeOdaProducts(browser, query, limit) {
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 3000));
 
+    // Try network interception first
+    if (networkRequests.length > 0) {
+      console.log(`Found ${networkRequests.length} API requests`);
+      const apiProducts = extractProductsFromApiResponses(networkRequests);
+      if (apiProducts.length > 0) {
+        console.log(`Extracted ${apiProducts.length} products from API responses`);
+        products.push(...apiProducts.slice(0, limit));
+        return products;
+      }
+    }
+
+    // Fall back to DOM evaluation
+    console.log('Falling back to DOM evaluation');
     const extractedProducts = await page.evaluate(() => {
       const products = [];
       const productCards = document.querySelectorAll('[data-testid="product-tile"]');
@@ -330,6 +362,78 @@ Return JSON:
   return {
     selectedIndices: (parsed.selectedIndices || []).map(idx => idx - 1),
     reasoning: parsed.reasoning || 'AI selected product'
+  };
+}
+
+// Extract products from API network responses
+function extractProductsFromApiResponses(requests) {
+  const products = [];
+  
+  for (const req of requests) {
+    if (!req.response) continue;
+    
+    const data = req.response;
+    
+    if (data.products && Array.isArray(data.products)) {
+      for (const item of data.products) {
+        const product = parseProductFromApi(item);
+        if (product) products.push(product);
+      }
+    } else if (data.data?.products && Array.isArray(data.data.products)) {
+      for (const item of data.data.products) {
+        const product = parseProductFromApi(item);
+        if (product) products.push(product);
+      }
+    } else if (data.results && Array.isArray(data.results)) {
+      for (const item of data.results) {
+        const product = parseProductFromApi(item);
+        if (product) products.push(product);
+      }
+    } else if (Array.isArray(data)) {
+      for (const item of data) {
+        if (item.id || item.name || item.title) {
+          const product = parseProductFromApi(item);
+          if (product) products.push(product);
+        }
+      }
+    }
+  }
+  
+  return products;
+}
+
+// Parse individual product from API response
+function parseProductFromApi(item) {
+  const id = item.id || item.product_id || item.sku || item.code;
+  const title = item.name || item.title || item.product_name;
+  const brand = item.brand || item.manufacturer || item.vendor;
+  
+  if (!title) {
+    return null;
+  }
+  
+  const priceValue = item.price ?? item.gross_price ?? item.sale_price ?? item.current_price;
+  const parsedPrice = typeof priceValue === 'number' ? priceValue : parseFloat(String(priceValue || 0));
+  
+  if (isNaN(parsedPrice) || parsedPrice <= 0) {
+    return null;
+  }
+  
+  const slugTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const weight = item.weight || item.size || item.volume || item.net_weight;
+  const deterministic = `${brand || 'unknown'}-${slugTitle}-${weight || 'std'}`.slice(0, 100);
+  
+  const fallbackId = id || deterministic;
+  
+  return {
+    id: String(fallbackId),
+    title: title,
+    brand: brand || undefined,
+    price: parsedPrice,
+    unit_price: item.unit_price || item.price_per_unit || item.comparison_price || undefined,
+    weight: weight || undefined,
+    image_url: item.image_url || item.image || item.thumbnail || item.images?.[0]?.url || undefined,
+    badges: Array.isArray(item.badges) ? item.badges : Array.isArray(item.labels) ? item.labels : Array.isArray(item.tags) ? item.tags : [],
   };
 }
 
