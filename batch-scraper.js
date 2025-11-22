@@ -529,7 +529,7 @@ function productToCandidate(product, ingredientId, store) {
     canonicalIngredientId: ingredientId,
     store: store,
     productName: product.title,
-    productUrl: product.id,
+    productUrl: product.image_url || null,  // FIXED: Use image_url instead of id
     packageSizeValue: null,
     packageSizeUnit: product.weight || null,
     priceNok: product.price.toString(),
@@ -613,8 +613,8 @@ async function processIngredient(browser, db, ingredient) {
     console.log(`Filtered to ${menyProducts.length} relevant Meny products`);
     
     if (odaProducts.length === 0 && menyProducts.length === 0) {
-      console.log('❌ No relevant products found on any store after filtering');
-      return { success: false, error: 'No relevant products found' };
+      console.log('❌ No relevant products found on any store after filtering\n');
+      return { success: false, error: 'No relevant products found', noResults: true };
     }
     
     // Convert to candidates
@@ -659,8 +659,8 @@ async function processIngredient(browser, db, ingredient) {
     const evaluation = await evaluateWithAI(ingredient.name, allCandidatesForAI);
     
     if (!evaluation || evaluation.selectedIndices.length === 0) {
-      console.log('❌ AI found no valid matches');
-      return { success: false, error: 'AI found no matches' };
+      console.log('❌ AI found no valid matches\n');
+      return { success: false, error: 'AI found no matches', noResults: true };
     }
     
     // Get selected product
@@ -686,7 +686,7 @@ async function processIngredient(browser, db, ingredient) {
       selectedCandidateId: selectedCandidateId,
       store: selectedStore,
       productName: selectedProduct.title,
-      productUrl: selectedProduct.id,
+      productUrl: selectedProduct.image_url || null,  // FIXED: Use image_url instead of id
       packageSizeValue: null,
       packageSizeUnit: selectedProduct.weight || null,
       priceNok: selectedProduct.price.toString(),
@@ -749,16 +749,20 @@ async function main() {
     const summary = {
       total: results.length,
       successful: results.filter(r => r.success).length,
-      failed: results.filter(r => !r.success).length
+      failed: results.filter(r => !r.success).length,
+      noResults: results.filter(r => !r.success && r.noResults).length,
+      actualErrors: results.filter(r => !r.success && !r.noResults).length
     };
     
     console.log('\n=== Batch Processing Summary ===');
     console.log(`Total processed: ${summary.total}`);
     console.log(`✓ Successful: ${summary.successful}`);
-    console.log(`✗ Failed: ${summary.failed}`);
+    console.log(`⚠️  No results found: ${summary.noResults}`);
+    console.log(`✗ Errors: ${summary.actualErrors}`);
     console.log(`Completed at: ${new Date().toISOString()}\n`);
     
-    process.exit(summary.failed > 0 ? 1 : 0);
+    // Only exit with error code if there were actual errors (not just "no results")
+    process.exit(summary.actualErrors > 0 ? 1 : 0);
   } catch (error) {
     console.error('\n❌ Batch processing failed:', error);
     process.exit(1);
