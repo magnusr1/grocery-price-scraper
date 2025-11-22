@@ -120,6 +120,12 @@ async function scrapeOdaProducts(browser, query, limit) {
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 3000));
 
+    // Debug: Check page content
+    const pageTitle = await page.title();
+    const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 200));
+    console.log(`Page title: ${pageTitle}`);
+    console.log(`Page preview: ${bodyText.substring(0, 100)}...`);
+
     // Try network interception first
     if (networkRequests.length > 0) {
       console.log(`Found ${networkRequests.length} API requests`);
@@ -133,6 +139,13 @@ async function scrapeOdaProducts(browser, query, limit) {
 
     // Fall back to DOM evaluation
     console.log('Falling back to DOM evaluation');
+    
+    // Debug: Count product tiles
+    const tileCount = await page.evaluate(() => {
+      return document.querySelectorAll('[data-testid="product-tile"]').length;
+    });
+    console.log(`Found ${tileCount} product tiles in DOM`);
+    
     const extractedProducts = await page.evaluate(() => {
       const products = [];
       const productCards = document.querySelectorAll('[data-testid="product-tile"]');
@@ -208,6 +221,18 @@ async function scrapeMenyProducts(browser, query, limit) {
     
     await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Debug: Check page content
+    const pageTitle = await page.title();
+    const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 200));
+    console.log(`Meny page title: ${pageTitle}`);
+    console.log(`Meny page preview: ${bodyText.substring(0, 100)}...`);
+    
+    // Debug: Count product cards
+    const productCount = await page.evaluate(() => {
+      return document.querySelectorAll('article.ProductTeaser').length;
+    });
+    console.log(`Found ${productCount} product cards in DOM`);
 
     const extractedProducts = await page.evaluate(() => {
       const products = [];
