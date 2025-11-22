@@ -1,0 +1,17 @@
+{
+  "name": "grocery-price-scraper",
+  "version": "1.0.0",
+  "description": "GitHub Actions cron job for scraping Oda and Meny prices",
+  "main": "batch-scraper.js",
+  "scripts": {
+    "test": "node batch-scraper.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0",
+    "pg": "^8.11.3",
+    "cheerio": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
