@@ -669,6 +669,7 @@ async function processIngredient(browser, db, ingredient) {
     
     if (!evaluation || evaluation.selectedIndices.length === 0) {
       console.log('❌ AI found no valid matches\n');
+      await db.markAsScraped(ingredient.id);
       return { success: false, error: 'AI found no matches', noResults: true };
     }
     
