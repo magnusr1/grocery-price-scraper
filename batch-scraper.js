@@ -16,20 +16,22 @@ class Database {
   }
 
   async getUnprocessedIngredients(limit) {
+    // Reads from FamilyOS 'ingredients' table (was 'canonical_ingredients' in standalone version)
     const result = await this.client.query(`
-      SELECT ci.id, ci.name
-      FROM canonical_ingredients ci
+      SELECT i.id, i.name
+      FROM ingredients i
       ORDER BY 
-        CASE WHEN ci.last_scraped_at IS NULL THEN 0 ELSE 1 END,
-        ci.last_scraped_at ASC NULLS FIRST
+        CASE WHEN i.last_scraped_at IS NULL THEN 0 ELSE 1 END,
+        i.last_scraped_at ASC NULLS FIRST
       LIMIT $1
     `, [limit]);
     return result.rows;
   }
 
   async markAsScraped(ingredientId) {
+    // Updates FamilyOS 'ingredients' table (was 'canonical_ingredients' in standalone version)
     await this.client.query(`
-      UPDATE canonical_ingredients
+      UPDATE ingredients
       SET last_scraped_at = NOW()
       WHERE id = $1
     `, [ingredientId]);
