@@ -4,6 +4,7 @@ const cheerio = require('cheerio');
 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '10');
 const CANDIDATES_PER_STORE = parseInt(process.env.CANDIDATES_PER_STORE || '5');
+const RESCRAPE_AFTER_DAYS = parseInt(process.env.RESCRAPE_AFTER_DAYS || '60'); // Only re-scrape after this many days
 
 // Database helper
 class Database {
@@ -15,16 +16,21 @@ class Database {
     await this.client.connect();
   }
 
-  async getUnprocessedIngredients(limit) {
+  async getUnprocessedIngredients(limit, rescrapeAfterDays) {
     // Reads from FamilyOS 'ingredients' table (was 'canonical_ingredients' in standalone version)
+    // Only returns ingredients that:
+    // 1. Have never been scraped (last_scraped_at IS NULL), OR
+    // 2. Were scraped more than rescrapeAfterDays ago (for price history updates)
     const result = await this.client.query(`
       SELECT i.id, i.name
       FROM ingredients i
+      WHERE i.last_scraped_at IS NULL 
+         OR i.last_scraped_at < NOW() - INTERVAL '1 day' * $2
       ORDER BY 
         CASE WHEN i.last_scraped_at IS NULL THEN 0 ELSE 1 END,
         i.last_scraped_at ASC NULLS FIRST
       LIMIT $1
-    `, [limit]);
+    `, [limit, rescrapeAfterDays]);
     return result.rows;
   }
 
@@ -735,8 +741,9 @@ async function main() {
   try {
     await db.connect();
     console.log('✓ Connected to database');
+    console.log(`Re-scrape cooldown: ${RESCRAPE_AFTER_DAYS} days`);
     
-    const ingredients = await db.getUnprocessedIngredients(BATCH_SIZE);
+    const ingredients = await db.getUnprocessedIngredients(BATCH_SIZE, RESCRAPE_AFTER_DAYS);
     
     if (ingredients.length === 0) {
       console.log('✓ No unprocessed ingredients found. All done!');
