@@ -31,6 +31,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BATCH_SIZE: '10'
           CANDIDATES_PER_STORE: '5'
+          RESCRAPE_AFTER_DAYS: '90'  # Only re-scrape ingredients older than 60 days
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
         run: node batch-scraper.js
         timeout-minutes: 30
