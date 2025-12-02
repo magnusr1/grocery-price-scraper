@@ -2,7 +2,8 @@ name: Scrape Grocery Prices
 
 on:
   schedule:
-    # Run every 10 minutes
+    # INITIAL BULK LOAD: Every 10 minutes (10 ingredients/run = ~8 hours for 500)
+    # After done, change to: '15 */6 * * *' (every 6 hours)
     - cron: '*/10 * * * *'
   
   # Allow manual trigger from GitHub Actions tab
@@ -28,6 +29,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BATCH_SIZE: '10'
+          CANDIDATES_PER_STORE: '5'
           PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'
         run: node batch-scraper.js
         timeout-minutes: 30
