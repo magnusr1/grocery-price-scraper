@@ -4,7 +4,7 @@ on:
   schedule:
     # INITIAL BULK LOAD: Every 10 minutes (10 ingredients/run = ~8 hours for 500)
     # After done, change to: '15 */6 * * *' (every 6 hours)
-    - cron: '*/10 * * * *'
+    - cron: '15 */6 * * *'
   
   # Allow manual trigger from GitHub Actions tab
   workflow_dispatch:
