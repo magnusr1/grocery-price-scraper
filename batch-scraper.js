@@ -20,12 +20,31 @@ class Database {
     // Reads from FamilyOS 'ingredients' table (was 'canonical_ingredients' in standalone version)
     // Only returns ingredients that:
     // 1. Have never been scraped (last_scraped_at IS NULL), OR
-    // 2. Were scraped more than rescrapeAfterDays ago (for price history updates)
+    // 2. Were scraped more than rescrapeAfterDays ago AND either:
+    //    a. Have a match (scrape_result = 'matched') - for price history updates
+    //    b. Had an error (scrape_result IS NULL) - to retry after cooldown
+    // 
+    // Skips ingredients with scrape_result = 'no_match' unless very old (1 year)
+    // because those genuinely have no products in stores
     const result = await this.client.query(`
       SELECT i.id, i.name
       FROM ingredients i
-      WHERE i.last_scraped_at IS NULL 
-         OR i.last_scraped_at < NOW() - INTERVAL '1 day' * $2
+      WHERE 
+        -- Never scraped
+        i.last_scraped_at IS NULL 
+        -- OR needs re-scrape (cooldown passed and not permanently unavailable)
+        OR (
+          i.last_scraped_at < NOW() - INTERVAL '1 day' * $2
+          AND (
+            i.scrape_result IS NULL  -- Had an error, retry
+            OR i.scrape_result = 'matched'  -- Has match, update price history
+          )
+        )
+        -- OR was marked no_match but very old (annual retry in case products added)
+        OR (
+          i.scrape_result = 'no_match' 
+          AND i.last_scraped_at < NOW() - INTERVAL '365 days'
+        )
       ORDER BY 
         CASE WHEN i.last_scraped_at IS NULL THEN 0 ELSE 1 END,
         i.last_scraped_at ASC NULLS FIRST
@@ -34,13 +53,18 @@ class Database {
     return result.rows;
   }
 
-  async markAsScraped(ingredientId) {
+  async markAsScraped(ingredientId, scrapeResult = null) {
     // Updates FamilyOS 'ingredients' table (was 'canonical_ingredients' in standalone version)
+    // scrapeResult can be:
+    //   'matched' - found a product match
+    //   'no_match' - scraper ran but found no valid products
+    //   null - interrupted/error (will allow retry)
     await this.client.query(`
       UPDATE ingredients
-      SET last_scraped_at = NOW()
+      SET last_scraped_at = NOW(),
+          scrape_result = $2
       WHERE id = $1
-    `, [ingredientId]);
+    `, [ingredientId, scrapeResult]);
   }
 
   async saveCandidates(candidates) {
@@ -630,7 +654,7 @@ async function processIngredient(browser, db, ingredient) {
     
     if (odaProducts.length === 0 && menyProducts.length === 0) {
       console.log('❌ No relevant products found on any store after filtering\n');
-      await db.markAsScraped(ingredient.id);
+      await db.markAsScraped(ingredient.id, 'no_match');
       return { success: false, error: 'No relevant products found', noResults: true };
     }
     
@@ -677,7 +701,7 @@ async function processIngredient(browser, db, ingredient) {
     
     if (!evaluation || evaluation.selectedIndices.length === 0) {
       console.log('❌ AI found no valid matches\n');
-      await db.markAsScraped(ingredient.id);
+      await db.markAsScraped(ingredient.id, 'no_match');
       return { success: false, error: 'AI found no matches', noResults: true };
     }
     
@@ -716,13 +740,15 @@ async function processIngredient(browser, db, ingredient) {
     console.log('✓ Saved observation to database');
     console.log(`=== Completed: ${ingredient.name} ===\n`);
     
-    await db.markAsScraped(ingredient.id);
+    await db.markAsScraped(ingredient.id, 'matched');
     
     return { success: true };
   } catch (error) {
     console.error(`Error processing ${ingredient.name}:`, error);
     
-    await db.markAsScraped(ingredient.id);
+    // Don't mark scrape_result on errors - leave it null so ingredient can be retried
+    // Only set last_scraped_at to prevent immediate retry in same batch
+    await db.markAsScraped(ingredient.id, null);
     
     return { success: false, error: error.message };
   }
