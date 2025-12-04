@@ -24,26 +24,35 @@ class Database {
     //    a. Have a match (scrape_result = 'matched') - for price history updates
     //    b. Had an error (scrape_result IS NULL) - to retry after cooldown
     // 
-    // Skips ingredients with scrape_result = 'no_match' unless very old (1 year)
-    // because those genuinely have no products in stores
+    // Skips:
+    // - Ingredients with scrape_result = 'no_match' unless very old (1 year)
+    // - Ingredients with manual prices (store = 'manual') - user entered these manually
     const result = await this.client.query(`
       SELECT i.id, i.name
       FROM ingredients i
       WHERE 
-        -- Never scraped
-        i.last_scraped_at IS NULL 
-        -- OR needs re-scrape (cooldown passed and not permanently unavailable)
-        OR (
-          i.last_scraped_at < NOW() - INTERVAL '1 day' * $2
-          AND (
-            i.scrape_result IS NULL  -- Had an error, retry
-            OR i.scrape_result = 'matched'  -- Has match, update price history
-          )
+        -- Skip ingredients with manual prices (like "rødvin" - user added these)
+        NOT EXISTS (
+          SELECT 1 FROM price_observations po 
+          WHERE po.canonical_ingredient_id = i.id 
+            AND po.store = 'manual'
         )
-        -- OR was marked no_match but very old (annual retry in case products added)
-        OR (
-          i.scrape_result = 'no_match' 
-          AND i.last_scraped_at < NOW() - INTERVAL '365 days'
+        AND (
+          -- Never scraped
+          i.last_scraped_at IS NULL 
+          -- OR needs re-scrape (cooldown passed and not permanently unavailable)
+          OR (
+            i.last_scraped_at < NOW() - INTERVAL '1 day' * $2
+            AND (
+              i.scrape_result IS NULL  -- Had an error, retry
+              OR i.scrape_result = 'matched'  -- Has match, update price history
+            )
+          )
+          -- OR was marked no_match but very old (annual retry in case products added)
+          OR (
+            i.scrape_result = 'no_match' 
+            AND i.last_scraped_at < NOW() - INTERVAL '365 days'
+          )
         )
       ORDER BY 
         CASE WHEN i.last_scraped_at IS NULL THEN 0 ELSE 1 END,
@@ -75,7 +84,7 @@ class Database {
     let paramIndex = 1;
 
     candidates.forEach((c, i) => {
-      placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`);
+      placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8})`);
       values.push(
         c.canonicalIngredientId,
         c.store,
@@ -84,16 +93,17 @@ class Database {
         c.packageSizeValue || null,
         c.packageSizeUnit || null,
         c.priceNok,
-        c.pricePerKgNok || null
+        c.pricePerKgNok || null,
+        c.storeProductId || null  // NEW: Store the product ID for re-scrape memory
       );
-      paramIndex += 8;
+      paramIndex += 9;
     });
 
     const query = `
       INSERT INTO price_observation_candidates 
-      (canonical_ingredient_id, store, product_name, product_url, package_size_value, package_size_unit, price_nok, price_per_kg_nok)
+      (canonical_ingredient_id, store, product_name, product_url, package_size_value, package_size_unit, price_nok, price_per_kg_nok, store_product_id)
       VALUES ${placeholders.join(', ')}
-      RETURNING id
+      RETURNING id, store_product_id
     `;
 
     const result = await this.client.query(query, values);
@@ -104,8 +114,8 @@ class Database {
     const result = await this.client.query(`
       INSERT INTO price_observations 
       (canonical_ingredient_id, selected_candidate_id, store, product_name, product_url, 
-       package_size_value, package_size_unit, price_nok, price_per_kg_nok, source_version)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       package_size_value, package_size_unit, price_nok, price_per_kg_nok, source_version, store_product_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING id
     `, [
       observation.canonicalIngredientId,
@@ -117,9 +127,24 @@ class Database {
       observation.packageSizeUnit || null,
       observation.priceNok,
       observation.pricePerKgNok || null,
-      observation.sourceVersion
+      observation.sourceVersion,
+      observation.storeProductId || null  // NEW: Store product ID for re-scrape memory
     ]);
     return result.rows[0];
+  }
+
+  // NEW: Get the latest observation for an ingredient (for re-scrape memory)
+  async getLatestObservation(ingredientId) {
+    const result = await this.client.query(`
+      SELECT 
+        id, store, product_name, store_product_id, source_version, reviewed_at,
+        price_nok, price_per_kg_nok
+      FROM price_observations
+      WHERE canonical_ingredient_id = $1
+      ORDER BY observed_at DESC
+      LIMIT 1
+    `, [ingredientId]);
+    return result.rows[0] || null;
   }
 
   async close() {
@@ -357,7 +382,8 @@ async function scrapeMenyProducts(browser, query, limit) {
 }
 
 // AI Evaluator
-async function evaluateWithAI(ingredientName, candidates) {
+// previousSelection: { productName, store } or null - for re-scrape context
+async function evaluateWithAI(ingredientName, candidates, previousSelection = null) {
   const candidatesList = candidates
     .map((c, i) => {
       const pricePerKg = c.pricePerKgNok ? `${c.pricePerKgNok.toFixed(2)} NOK/kg` : 'N/A';
@@ -366,8 +392,20 @@ async function evaluateWithAI(ingredientName, candidates) {
     })
     .join('\n');
 
-  const prompt = `You are selecting the BEST MATCHING product for the ingredient "${ingredientName}" for accurate recipe price estimation.
+  // Build context about previous selection for re-scrapes
+  let previousContext = '';
+  if (previousSelection) {
+    previousContext = `
+PREVIOUS SELECTION CONTEXT:
+Previously selected: "${previousSelection.productName}" from ${previousSelection.store.toUpperCase()}
+This is a re-scrape. Consider maintaining product continuity unless a significantly better match exists.
+If the previous product is still available in the list, prefer it unless there's a compelling reason to switch.
 
+`;
+  }
+
+  const prompt = `You are selecting the BEST MATCHING product for the ingredient "${ingredientName}" for accurate recipe price estimation.
+${previousContext}
 Product candidates from Oda and Meny stores:
 ${candidatesList}
 
@@ -382,7 +420,7 @@ SELECTION CRITERIA (in priority order):
    - Choose products that represent common consumer purchases
    - Consider typical quality expectations for the ingredient type
    - NOT always the lowest price, but realistic everyday choice
-
+${previousSelection ? '5. **Continuity** - If previous selection is still available and equally good, prefer it\n' : ''}
 IMPORTANT: Price estimation should reflect REALISTIC shopping behavior, not bargain hunting or luxury purchases.
 
 If NO exact match exists:
@@ -573,7 +611,8 @@ function productToCandidate(product, ingredientId, store) {
     packageSizeValue: null,
     packageSizeUnit: product.weight || null,
     priceNok: product.price.toString(),
-    pricePerKgNok: pricePerKg ? pricePerKg.toString() : null
+    pricePerKgNok: pricePerKg ? pricePerKg.toString() : null,
+    storeProductId: product.id || null  // NEW: Store product ID for re-scrape memory
   };
 }
 
@@ -635,11 +674,70 @@ function filterRelevantProducts(products, ingredientName) {
   return filtered;
 }
 
+// Check if a previous observation was manually overridden by the user
+function isManualOverride(observation) {
+  if (!observation) return false;
+  // Manual override is when user selected a different candidate in admin UI
+  return observation.reviewed_at && 
+         observation.source_version && 
+         observation.source_version.includes('Manual override');
+}
+
+// Find a product in candidates that matches the previous selection (by store_product_id or product name)
+function findPreviousProductInCandidates(previousObs, allProducts, allCandidates) {
+  if (!previousObs) return null;
+
+  // First try exact match by store_product_id (most reliable)
+  if (previousObs.store_product_id) {
+    for (let i = 0; i < allProducts.length; i++) {
+      if (allProducts[i].id === previousObs.store_product_id) {
+        console.log(`✓ Found previous product by ID: ${previousObs.store_product_id}`);
+        return { index: i, matchType: 'product_id' };
+      }
+    }
+  }
+
+  // Fallback: try fuzzy match by product name (for older observations without store_product_id)
+  if (previousObs.product_name) {
+    const prevNameLower = previousObs.product_name.toLowerCase();
+    for (let i = 0; i < allProducts.length; i++) {
+      const candidateName = allProducts[i].title.toLowerCase();
+      // Exact name match
+      if (candidateName === prevNameLower) {
+        console.log(`✓ Found previous product by exact name: "${previousObs.product_name}"`);
+        return { index: i, matchType: 'name_exact' };
+      }
+    }
+    // Try substring match (product might have slightly different name)
+    for (let i = 0; i < allProducts.length; i++) {
+      const candidateName = allProducts[i].title.toLowerCase();
+      if (candidateName.includes(prevNameLower) || prevNameLower.includes(candidateName)) {
+        console.log(`✓ Found previous product by similar name: "${allProducts[i].title}" ≈ "${previousObs.product_name}"`);
+        return { index: i, matchType: 'name_similar' };
+      }
+    }
+  }
+
+  return null;
+}
+
 // Main processing logic
 async function processIngredient(browser, db, ingredient) {
   console.log(`\n=== Processing ingredient: ${ingredient.name} ===`);
   
   try {
+    // Check for previous observation (re-scrape memory)
+    const previousObs = await db.getLatestObservation(ingredient.id);
+    const isRescrape = !!previousObs;
+    const wasManuallyOverridden = isManualOverride(previousObs);
+    
+    if (isRescrape) {
+      console.log(`📝 Re-scrape detected. Previous: "${previousObs.product_name}" from ${previousObs.store}`);
+      if (wasManuallyOverridden) {
+        console.log(`⚠️  User manually selected this product - will try to find same product first`);
+      }
+    }
+
     // Scrape Oda
     const odaProductsRaw = await scrapeOdaProducts(browser, ingredient.name, CANDIDATES_PER_STORE);
     console.log(`Found ${odaProductsRaw.length} raw products on Oda`);
@@ -667,54 +765,95 @@ async function processIngredient(browser, db, ingredient) {
     const savedMeny = await db.saveCandidates(menyCandidates);
     console.log(`Saved ${savedOda.length + savedMeny.length} candidates to database`);
     
-    // Prepare for AI evaluation
-    const allCandidatesForAI = [
-      ...odaProducts.map(p => {
-        let pricePerKg = extractPricePerKg(p.unit_price);
-        if (!pricePerKg && p.weight) {
-          pricePerKg = calculatePricePerKg(p.price, p.weight);
-        }
-        return {
-          productName: p.title,
-          priceNok: p.price,
-          pricePerKgNok: pricePerKg,
-          store: 'oda'
-        };
-      }),
-      ...menyProducts.map(p => {
-        let pricePerKg = extractPricePerKg(p.unit_price);
-        if (!pricePerKg && p.weight) {
-          pricePerKg = calculatePricePerKg(p.price, p.weight);
-        }
-        return {
-          productName: p.title,
-          priceNok: p.price,
-          pricePerKgNok: pricePerKg,
-          store: 'meny'
-        };
-      })
-    ];
+    const allProducts = [...odaProducts, ...menyProducts];
+    const allSavedIds = [...savedOda, ...savedMeny];
     
-    // AI evaluation
-    console.log('\n--- AI Evaluation ---');
-    const evaluation = await evaluateWithAI(ingredient.name, allCandidatesForAI);
-    
-    if (!evaluation || evaluation.selectedIndices.length === 0) {
-      console.log('❌ AI found no valid matches\n');
-      await db.markAsScraped(ingredient.id, 'no_match');
-      return { success: false, error: 'AI found no matches', noResults: true };
+    let selectedIdx = null;
+    let sourceVersionPrefix = 'scraper_v2';
+    let reasoning = '';
+
+    // For manually-overridden items, try to find the same product first (fast path, no AI call)
+    if (wasManuallyOverridden) {
+      const match = findPreviousProductInCandidates(previousObs, allProducts, allSavedIds);
+      
+      if (match) {
+        // Found the same product - just update the price (no AI needed!)
+        selectedIdx = match.index;
+        sourceVersionPrefix = 'scraper_v2_continuity';
+        reasoning = `Maintained user selection (${match.matchType}). Product: "${previousObs.product_name}"`;
+        console.log(`🎯 FAST PATH: Using previously selected product (${match.matchType} match)`);
+      } else {
+        // Product not found - need AI, but inform user
+        console.log(`⚠️  Previously selected product not found in current results`);
+        console.log(`   Previous: "${previousObs.product_name}" (${previousObs.store})`);
+        console.log(`   Will run AI selection with previous context...`);
+      }
+    }
+
+    // If we don't have a selection yet (new ingredient or product not found), run AI
+    if (selectedIdx === null) {
+      // Prepare for AI evaluation
+      const allCandidatesForAI = [
+        ...odaProducts.map(p => {
+          let pricePerKg = extractPricePerKg(p.unit_price);
+          if (!pricePerKg && p.weight) {
+            pricePerKg = calculatePricePerKg(p.price, p.weight);
+          }
+          return {
+            productName: p.title,
+            priceNok: p.price,
+            pricePerKgNok: pricePerKg,
+            store: 'oda'
+          };
+        }),
+        ...menyProducts.map(p => {
+          let pricePerKg = extractPricePerKg(p.unit_price);
+          if (!pricePerKg && p.weight) {
+            pricePerKg = calculatePricePerKg(p.price, p.weight);
+          }
+          return {
+            productName: p.title,
+            priceNok: p.price,
+            pricePerKgNok: pricePerKg,
+            store: 'meny'
+          };
+        })
+      ];
+      
+      // Build previous selection context for AI (if this is a re-scrape)
+      const previousSelection = isRescrape ? {
+        productName: previousObs.product_name,
+        store: previousObs.store
+      } : null;
+
+      // AI evaluation (with context about previous selection for re-scrapes)
+      console.log('\n--- AI Evaluation ---');
+      const evaluation = await evaluateWithAI(ingredient.name, allCandidatesForAI, previousSelection);
+      
+      if (!evaluation || evaluation.selectedIndices.length === 0) {
+        console.log('❌ AI found no valid matches\n');
+        await db.markAsScraped(ingredient.id, 'no_match');
+        return { success: false, error: 'AI found no matches', noResults: true };
+      }
+      
+      selectedIdx = evaluation.selectedIndices[0];
+      reasoning = evaluation.reasoning;
+      
+      // If this was a manual override and product not found, note it in the source
+      if (wasManuallyOverridden) {
+        sourceVersionPrefix = 'scraper_v2_override_changed';
+        reasoning = `Previous selection "${previousObs.product_name}" not found. New selection: ${reasoning}`;
+      }
     }
     
     // Get selected product
-    const selectedIdx = evaluation.selectedIndices[0];
-    const allProducts = [...odaProducts, ...menyProducts];
-    const allSavedIds = [...savedOda, ...savedMeny];
     const selectedProduct = allProducts[selectedIdx];
     const selectedCandidateId = allSavedIds[selectedIdx].id;
     const selectedStore = selectedIdx < odaProducts.length ? 'oda' : 'meny';
+    const selectedStoreProductId = selectedProduct.id || null;
     
-    console.log(`✓ AI selected: ${selectedProduct.title} from ${selectedStore}`);
-    console.log(`  Reasoning: ${evaluation.reasoning}`);
+    console.log(`✓ Selected: ${selectedProduct.title} from ${selectedStore}`);
+    console.log(`  Reasoning: ${reasoning}`);
     
     // Calculate final price per kg
     let finalPricePerKg = extractPricePerKg(selectedProduct.unit_price);
@@ -728,12 +867,13 @@ async function processIngredient(browser, db, ingredient) {
       selectedCandidateId: selectedCandidateId,
       store: selectedStore,
       productName: selectedProduct.title,
-      productUrl: selectedProduct.image_url || null,  // FIXED: Use image_url instead of id
+      productUrl: selectedProduct.image_url || null,
       packageSizeValue: null,
       packageSizeUnit: selectedProduct.weight || null,
       priceNok: selectedProduct.price.toString(),
       pricePerKgNok: finalPricePerKg ? finalPricePerKg.toString() : null,
-      sourceVersion: `scraper_v2: ${evaluation.reasoning}`
+      sourceVersion: `${sourceVersionPrefix}: ${reasoning}`,
+      storeProductId: selectedStoreProductId  // NEW: Store product ID for future re-scrapes
     };
     
     await db.saveObservation(observation);
